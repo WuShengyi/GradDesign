@@ -163,9 +163,9 @@ int AddWordToVocab(char *word)
   hash = GetWordHash(word);  
   while (vocab_hash[hash] != -1)//如果hash值冲突了  
       hash = (hash + 1) % vocab_hash_size;//使用开放地址法解决冲突  
-  vocab_hash[hash] = word_size - 1;
+  vocab_hash[hash] = vocab_size - 1;
   //由词的hash值找到她所在词汇表的排序位置  
-  return word_size - 1;  
+  return vocab_size - 1;  
 }
 
 int AddWordToVocab_HowNet(char *word)  
@@ -182,7 +182,7 @@ int AddWordToVocab_HowNet(char *word)
     hownet_max_size += 1000;  
     hownet = (struct vocab_word *)realloc(hownet, hownet_max_size * sizeof(struct hownet_word)); 
   }  
-  hash = GetWordHash(word);  
+  hash = GetWordHash_HowNet(word);  
   while (hownet_hash[hash] != -1)//如果hash值冲突了  
       hash = (hash + 1) % hownet_hash_size;//使用开放地址法解决冲突  
   hownet_hash[hash] = word_size - 1;
@@ -200,6 +200,14 @@ int GetWordHash(char *word)
   return hash;  
 }
 
+int GetWordHash_HowNet(char *word)  
+{  
+  unsigned long long a, hash = 0;  
+  for (a = 0; a < strlen(word); a++)  
+      hash = hash * 257 + word[a];//采取257进制  
+  hash = hash % hownet_hash_size;  
+  return hash;  
+}
 //get the hash value based on the word and one of the sepecific meaning of the word
 int GetWordMeanHash(char *wordmean)  
 {  
@@ -228,7 +236,7 @@ int SearchVocab(char *word)
 
 
 int SearchVocab_Hownet(char *word){
-  unsigned int hash = GetWordHash(word);  
+  unsigned int hash = GetWordHash_HowNet(word);  
   while (1)  
   {  
     if (hownet_hash[hash] == -1) return -1;  
@@ -298,7 +306,10 @@ int AddWordMeanToWordMeans(char *word,char *mean)
   
 // Used later for sorting by word counts  
 
-
+int VocabCompare(const void *a, const void *b)  
+{  
+    return ((struct vocab_word *)b)->cn - ((struct vocab_word *)a)->cn;  
+}  
 //////////////
 int WordMeanCompare(const void *a,const void *b){ 
   return ((struct wordmeans_wordmean *)b)->cn-((struct wordmeans_wordmean *)a)->cn;
@@ -307,20 +318,58 @@ int WordMeanCompare(const void *a,const void *b){
 // Sorts the vocabulary by frequency using word counts  
 // 根据词频排序  
  
-
+void SortVocab()  
+{  
+  int a, size;  
+  unsigned int hash;  
+  // Sort the vocabulary and keep </s> at the first position  
+  qsort(&vocab[1], vocab_size - 1, sizeof(struct vocab_word), VocabCompare);  
+  for (a = 0; a < vocab_hash_size; a++)  //因为vocab已经重新排序了，所以要重新生成HASH表
+      vocab_hash[a] = -1;  
+  size = vocab_size;  
+  train_words = 0;  
+  for (a = 0; a < size; a++)  
+  {  
+    // Words occuring less than min_count times will be discarded from the vocab  
+    //出现太少的词直接丢弃  
+    if (vocab[a].cn < min_count)  
+    {  
+      vocab_size--;  
+      free(vocab[vocab_size].word);  
+    }  
+    else  
+    {  
+      // Hash will be re-computed, as after the sorting it is not actual  
+      // 重新计算hash查找。vocab_hash是由hash值找到该词所在位置  
+      hash=GetWordHash(vocab[a].word);  
+      while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;  
+      vocab_hash[hash] = a;  
+      train_words += vocab[a].cn;  
+    }  
+  }  
+  vocab = (struct vocab_word *)realloc(vocab, (vocab_size + 1) * sizeof(struct vocab_word));  
+}
 
 ///////////////////////////
 void SortWordMeans()  
 {  
+  printf("begin sort\n");
+  getchar();
   int a, size;  
-  unsigned int hash;  
+  unsigned int hash; 
   char wordmean[2*MAX_STRING];
-  // Sort the vocabulary and keep </s> at the first position  
-  qsort(&wordmeans[1], wordmeans_size - 1, sizeof(struct wordmeans_wordmean), WordMeanCompare);  
+  // Sort the vocabulary and keep </s> at the first position 
+  printf("%lld\n", wordmeans_size);
+  getchar(); 
+  qsort(&wordmeans[1], wordmeans_size - 1, sizeof(struct wordmeans_wordmean), WordMeanCompare); 
+  printf("sort ok\n");
+  getchar(); 
   for (a = 0; a < wordmeans_hash_size; a++)  //因为vocab已经重新排序了，所以要重新生成HASH表
       wordmeans_hash[a] = -1;  
   size = wordmeans_size;  
   train_words = 0;  
+  printf("inital ok\n");
+  getchar();
   for (a = 0; a < size; a++)  
   {  
     // Words occuring less than min_count times will be discarded from the vocab  
@@ -329,11 +378,6 @@ void SortWordMeans()
     {  	
 
     	wordmeans_size--;  
-    	int  pos=SearchVocab(wordmeans[a].word);
-      	if(pos!=-1){
-      		vocab_size--;
-      		free(vocab[pos].word);
-      	}
       free(wordmeans[a].word);  
       free(wordmeans[a].mean);
     }  
@@ -350,7 +394,9 @@ void SortWordMeans()
       train_words += wordmeans[a].cn;  
       /////train_words??
     }  
-  }  
+  }
+  printf("delete low fqre word ok\n");  
+  getchar();
   wordmeans= (struct wordmeans_wordmean *)realloc(wordmeans, (wordmeans_size + 1) * sizeof(struct wordmeans_wordmean));  
   // Allocate memory for the binary tree construction  
   for (a = 0; a < wordmeans_size; a++)  
@@ -363,7 +409,30 @@ void SortWordMeans()
   
 // Reduces the vocabulary by removing infrequent tokens  
 // 再次移除词频过小的词，缩减词汇表  
-
+void ReduceVocab()  
+{  
+  int a, b = 0;  
+  unsigned int hash;  
+  for (a = 0; a < vocab_size; a++)//我草，这很容易看错啊   //的确容易看错
+  if (vocab[a].cn > min_reduce)  
+  {  
+    vocab[b].cn = vocab[a].cn;  
+    vocab[b].word = vocab[a].word;  
+    b++;  
+  }  
+  else free(vocab[a].word);  
+  vocab_size = b;  
+  for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;  //再次重新生成hash
+  for (a = 0; a < vocab_size; a++) {  
+    // Hash will be re-computed, as it is not actual  
+    hash = GetWordHash(vocab[a].word);  
+    while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;  
+    vocab_hash[hash] = a;  
+  }  
+  fflush(stdout);  //ff(stdin)刷新标准输入缓冲区，把输入缓冲区里的东西丢弃   
+    		   //fflush(stdout)刷新标准输出缓冲区，把输出缓冲区里的东西打印到标准输出设备上。
+  min_reduce++;  
+}
 ///////////
 void ReduceWordMeans()  
 {  
@@ -380,12 +449,6 @@ void ReduceWordMeans()
       b++;  
     } 
     else {
-    	 word=wordmeans[a].word;
-    	 int i=SearchVocab(word); 
-    	 if(i!=-1){
-    	 	free(vocab[i].word);
-    	 	vocab_size--;  
-    	 }
     	 free(wordmeans[a].word);
     	 free(wordmeans[a].mean);
     }
@@ -404,6 +467,7 @@ void ReduceWordMeans()
   fflush(stdout);  //ff(stdin)刷新标准输入缓冲区，把输入缓冲区里的东西丢弃   
            //fflush(stdout)刷新标准输出缓冲区，把输出缓冲区里的东西打印到标准输出设备上。
   min_reduce++;  
+  
 }  
 /////////
 //Import word and it's meannings
@@ -511,7 +575,7 @@ void CreateBinaryTree_WordMean() {
       if (b == wordmeans_size * 2 - 2) break;  
     }  
     wordmeans[a].codelen = i;  
-    wordmeans[a].point[0] = wordmeans - 2;  
+    wordmeans[a].point[0] = wordmeans_size - 2;  
     for (b = 0; b < i; b++)  
     {  
       wordmeans[a].code[i - b - 1] = code[b];  
@@ -561,12 +625,18 @@ void LearnWordMeanFromTrainFile()
     }  
     i = SearchVocab(word);//返回该词在词汇表中的位置  
     hownet_pos=SearchVocab_Hownet(word);
-    if (i == -1)//can't find the word  
+    if (hownet_pos== -1)//can't find the word  
     {  
-    	AddWordToVocab(word);
+    	continue;
     }  
-    else{//get the meanings
-    	
+    else{
+    	if(i==-1){
+    		AddWordToVocab(word);
+    		vocab[i].cn=1;
+    	}
+    	else{
+    		vocab[i].cn++;
+    	}//get the meanings
     	const char *split=" ";
     	strcpy(means,hownet[hownet_pos].means);
     	strcpy(word,hownet[hownet_pos].word);
@@ -596,18 +666,19 @@ void LearnWordMeanFromTrainFile()
     		}
     		mean = strtok(NULL,split);
 		} 
-		printf("add means ok\n");
-		getchar();
     	if (vocab_size > vocab_hash_size * 0.7){//如果词汇表太庞大，就缩减 //because the wordmeans and vocab have similary process of increasement    
         	ReduceWordMeans();
+        	ReduceVocab();
      	} 
-     	printf("add ok\n");
-		getchar();
   	}
   }  
-  printf("%lld",train_words);
+  printf("%lld,%lld\n",train_words,vocab_size);
+   printf("%lld\n",wordmeans_size);
   getchar(); 
-  SortWordMeans();//根据词频排序词汇表  
+  SortVocab();
+  SortWordMeans();//根据词频排序词汇表
+  printf("sort ok");
+  getchar();  
   if (debug_mode > 0)  
   {   
     printf("Words in train file: %lld\n", train_words);  
@@ -665,7 +736,8 @@ void ReadWordMeans()
     a = AddWordMeanToWordMeans(word,mean);//把该词添加到词汇中，并返回该词的位置  
     fscanf(fin, "%lld%c", &wordmeans[a].cn, &c);//读取词频？c是干啥的吗，读取空格吗  //应该是，总不能不读取吧
     i++;  
-  }  
+  }
+  SortVocab();  
   SortWordMeans();//根据词频排序  
   if (debug_mode > 0)  
   {  
@@ -739,7 +811,7 @@ void *TrainModelThread(void *id)
   		if (feof(fi)) continue; 
   		hownet_pos=SearchVocab_Hownet(wordstr); 
  		word=SearchVocab(wordstr);//从文件流中读取一个词，并返回这个词在词汇表and in hownet中的位置  
-        printf("%lld\n",word);
+        printf("%lld\n,%s",word,wordstr);
         getchar();
         if (feof(fi)) break;  
         if (word == -1) continue;  
@@ -785,7 +857,8 @@ void *TrainModelThread(void *id)
       		strcpy(wordmean,vocab[word].word);
       		strcat(wordmean,mean);
       		wordmean_pos=SearchWordMean(wordmean);
-      		printf("wordmean position done\n");
+      		printf("%s\n",wordmean);
+      		printf("wordmean position done\n,%d",wordmean_pos);
       		getchar();
       		if (cbow)  
       		{  //train the cbow architecture  
@@ -815,9 +888,11 @@ void *TrainModelThread(void *id)
       			{  
       				printf("begin\n");
       				getchar();
-       				f = 0;  
+       				f = 0;
+       				printf("%s\n", wordmeans[wordmean_pos].word);
+       				getchar();  
         			l2 = wordmeans[wordmean_pos].point[d] * layer1_size;//point应该记录的是huffman的路径。找到当前节点，并算出偏移  每一个词向量是占据一个layer1_size的
-        			// Propagate hidden -> output  
+        			// Propagate hidden -> output  	
         			printf("l2 done\n");
         			getchar();
         			for (c = 0; c < layer1_size; c++) 
@@ -993,6 +1068,9 @@ void *TrainModelThread(void *id)
 
 void InitNet()  
 {  
+  
+	printf("init begin\n");
+	getchar();
   long long a, b;  
   a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));  
   //先知道这个也是申请动态数组，对齐还有128这个参数以后再了解  
@@ -1037,6 +1115,9 @@ void InitNet()
       for (a = 0; a < vocab_size; a++){  
           	syn0[a * layer1_size + b] = (rand() / (real)RAND_MAX - 0.5) / layer1_size;
          }  //随机初始化词向量
+
+	printf("init done\n");
+	getchar();
   CreateBinaryTree_WordMean();//建立huffman树，对每个单词进行编码  
 }
 
@@ -1054,7 +1135,7 @@ void TrainModel()
       LearnWordMeanFromTrainFile();//从训练文件学习词汇  
   if (save_wordmeans_file[0] != 0)  
       SaveWordMeans();//保存词汇  
-  if (output_file[0] == 0)  
+  if (output_file[0] == 0) 
       return;
   printf("learn ok");
   getchar();  
