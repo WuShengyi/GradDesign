@@ -1,6 +1,10 @@
 //this is a word2vec in c
 //下面是我对word2vec.c的注释  
 //详细算法可以参考论文，或者看这篇博客 http://www.cnblogs.com/downtjs/p/3784440.html  
+
+
+
+//this version calculate vector separatively 
   
   
 //  Copyright 2013 Google Inc. All Rights Reserved.  
@@ -28,9 +32,11 @@
 #define MAX_EXP 6  
 #define MAX_SENTENCE_LENGTH 1000  
 #define MAX_CODE_LENGTH 40  
+#define max(a,b) (((a) > (b)) ? (a) : (b))
   
 const int vocab_hash_size = 30000000;  // Maximum 30 * 0.7 = 21M words in the vocabulary  
-  
+const int hownet_hash_size=100000000;
+const int wordmeans_hash_size=100000000;
 typedef float real;                    // Precision of float numbers  
   
 struct vocab_word  
@@ -39,13 +45,29 @@ struct vocab_word
   int *point;//huffman编码对应内节点的路径  
   char *word, *code, codelen;//huffman编码  
 };  
-  
+struct hownet_word
+{
+  char *word,*means; 
+};
+struct wordmeans_wordmean{
+  long long cn;
+  char *word,*mean;
+};
+
 char train_file[MAX_STRING], output_file[MAX_STRING];  
-char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];  
-struct vocab_word *vocab;  
+char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING]; 
+char dictionary_file[MAX_STRING];  
+struct vocab_word *vocab; 
+struct hownet_word *hownet;
+struct wordmeans_wordmean *wordmeans;
 int binary = 0, cbow = 0, debug_mode = 2, window = 5, min_count = 5, num_threads = 1, min_reduce = 1;  
-int *vocab_hash;  
+int *vocab_hash; 
+int *hownet_hash; 
+int *wordmeans_hash; 
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;  
+long long hownet_max_size=1000,word_size=0;
+long long wordmeans_size=0,wordmeans_max_size=1000;
+
 long long train_words = 0, word_count_actual = 0, file_size = 0, classes = 0;  
 real alpha = 0.025, starting_alpha, sample = 0;  
 real *syn0, *syn1, *syn1neg, *expTable;  
@@ -104,6 +126,24 @@ void ReadWord(char *word, FILE *fin) {
   }  
   word[a] = 0;  
 }  
+
+void Readline(char *line,FILE *fin){
+  int a = 0, ch;
+  while (!feof(fin)) {  
+    ch = fgetc(fin);  
+    if (ch == 13) continue; 
+    if(ch=='\n' ){
+      if(a>0)
+        break;
+      else 
+        continue;
+    }
+    line[a] = ch;  
+    a++;  
+    if (a >= MAX_STRING - 1) a--;   // Truncate too long words  
+  }  
+  line[a] = 0; 
+}
   
 // Returns hash value of a word返回一个词的hash值，一个词跟hash值一一对应（可能冲突）  
 int GetWordHash(char *word)  
@@ -113,8 +153,41 @@ int GetWordHash(char *word)
       hash = hash * 257 + word[a];//采取257进制  
   hash = hash % vocab_hash_size;  
   return hash;  
-}  
+}
+
+int GetWordHash_HowNet(char *word)  
+{  
+  unsigned long long a, hash = 0;  
+  for (a = 0; a < strlen(word); a++)  
+      hash = hash * 257 + word[a];//采取257进制  
+  hash = hash % hownet_hash_size;  
+  return hash;  
+}
   
+
+int GetWordMeanHash(char *wordmean)  
+{  
+  unsigned long long a, hash = 0;  
+  for (a = 0; a < strlen(wordmean); a++)  
+      hash = hash * 257 + wordmean[a];//采取257进制  
+  hash = hash % wordmeans_hash_size;  
+  return hash;  
+}
+
+
+int SearchWordMean(char *wordmean){
+  unsigned int hash = GetWordMeanHash(wordmean); 
+  char wordmean2[2*MAX_STRING];
+  while (1)  
+  {  
+    if (wordmeans_hash[hash] == -1) return -1;  
+    strcpy(wordmean2,wordmeans[wordmeans_hash[hash]].mean);
+    if (!strcmp(wordmean, wordmean2))  //strcmp如果相等返回值为0
+        return wordmeans_hash[hash];  
+    hash = (hash + 1) % wordmeans_hash_size;  
+  }  
+  return -1; 
+}
 // Returns position of a word in the vocabulary; if the word is not found, returns -1  
 // 返回一个词在词汇表中的位置，如果不存在则返回-1  
 int SearchVocab(char *word)  
@@ -129,6 +202,18 @@ int SearchVocab(char *word)
   }  
   return -1;  
 }  
+
+int SearchHownet(char *word){
+  unsigned int hash = GetWordHash_HowNet(word);  
+  while (1)  
+  {  
+    if (hownet_hash[hash] == -1) return -1;  
+    if (!strcmp(word, hownet[hownet_hash[hash]].word))  //strcmp如果相等返回值为0
+        return hownet_hash[hash];  
+    hash = (hash + 1) % hownet_hash_size;  
+  }
+  return -1;  
+}
   
 // Reads a word and returns its index in the vocabulary  
 // 从文件流中读取一个词，并返回这个词在词汇表中的位置  
@@ -139,17 +224,46 @@ int ReadWordIndex(FILE *fin)
   if (feof(fin)) return -1;  
   return SearchVocab(word);  
 }  
-  
+
+
+int AddWordMeanToWordMeans(char *mean)  
+{  
+  unsigned int hash, length = strlen(mean) + 1;  
+  if (length > MAX_STRING)  
+      length = MAX_STRING;  
+  //c的内存管理是真的很麻烦 
+  wordmeans[wordmeans_size].mean= (char *)calloc(length, sizeof(char));  
+  strcpy(wordmeans[wordmeans_size].mean, mean);
+  wordmeans[wordmeans_size].cn = 1;  
+  wordmeans_size++;  
+  // Reallocate memory if needed  
+  if (wordmeans_size + 2 >= wordmeans_max_size)  
+  {  
+    wordmeans_max_size += 1000;  
+    wordmeans= (struct wordmeans_wordmean *)realloc(wordmeans, wordmeans_max_size * sizeof(struct wordmeans_wordmean));  
+  }  
+  char *wordmean=(char *)calloc(length,sizeof(char));
+  strcpy(wordmean,mean);
+  hash =GetWordMeanHash(wordmean);
+  while (wordmeans_hash[hash] != -1)//如果hash值冲突了  
+      hash = (hash + 1) % wordmeans_hash_size;//使用开放地址法解决冲突  
+  wordmeans_hash[hash] = wordmeans_size - 1;//由词的hash值找到她所在词汇表的排序位置  
+  return wordmeans_size - 1;  
+}
+
+
 // Adds a word to the vocabulary 将一个词添加到一个词汇中  
 int AddWordToVocab(char *word)  
 {  
   unsigned int hash, length = strlen(word) + 1;  
+  long long hownet_pos;
   if (length > MAX_STRING)  
       length = MAX_STRING;  
   vocab[vocab_size].word = (char *)calloc(length, sizeof(char));  
   strcpy(vocab[vocab_size].word, word);  //c的内存管理是真的很麻烦
   vocab[vocab_size].cn = 0;  
   vocab_size++;  
+  hownet_pos=SearchHownet(word);
   // Reallocate memory if needed  
   if (vocab_size + 2 >= vocab_max_size)  
   {  
@@ -162,12 +276,38 @@ int AddWordToVocab(char *word)
   vocab_hash[hash] = vocab_size - 1;//由词的hash值找到她所在词汇表的排序位置  
   return vocab_size - 1;  
 }  
+
+int AddWordToHowNet(char *word)  
+{ 
+  unsigned int hash, length = strlen(word) + 1;  
+  if (length > MAX_STRING)  
+      length = MAX_STRING;  
+  hownet[word_size].word = (char *)calloc(length, sizeof(char));  
+  strcpy(hownet[word_size].word, word);  //c的内存管理是真的很麻烦 
+  word_size++; 
+  // Reallocate memory if needed  
+  if (word_size + 2 >= hownet_max_size)  
+  {  
+    hownet_max_size += 1000;  
+    hownet = (struct hownet_word *)realloc(hownet, hownet_max_size * sizeof(struct hownet_word)); 
+  }  
+  hash = GetWordHash_HowNet(word);  
+  while (hownet_hash[hash] != -1)//如果hash值冲突了  
+      hash = (hash + 1) % hownet_hash_size;//使用开放地址法解决冲突  
+  hownet_hash[hash] = word_size - 1;
+  //由词的hash值找到她所在词汇表的排序位置  
+  return word_size - 1;  
+}
   
 // Used later for sorting by word counts  
 int VocabCompare(const void *a, const void *b)  
 {  
     return ((struct vocab_word *)b)->cn - ((struct vocab_word *)a)->cn;  
 }  
+
+int WordMeanCompare(const void *a,const void *b){ 
+  return ((struct wordmeans_wordmean *)b)->cn-((struct wordmeans_wordmean *)a)->cn;
+}
   
 // Sorts the vocabulary by frequency using word counts  
 // 根据词频排序  
@@ -188,7 +328,8 @@ void SortVocab()
     if (vocab[a].cn < min_count)  
     {  
       vocab_size--;  
-      free(vocab[vocab_size].word);  
+      free(vocab[a].word);
+      vocab[a].word=NULL;  
     }  
     else  
     {  
@@ -208,7 +349,85 @@ void SortVocab()
     vocab[a].point = (int *)calloc(MAX_CODE_LENGTH, sizeof(int));  
   }  
 }  
+ 
+void SortWordMeans()  
+{  
+
+  int a, size;  
+  unsigned int hash; 
+  char wordmean[2*MAX_STRING];
+  // Sort the vocabulary and keep </s> at the first position 
+  qsort(&wordmeans[1], wordmeans_size - 1, sizeof(struct wordmeans_wordmean), WordMeanCompare); 
+  for (a = 0; a < wordmeans_hash_size; a++)  //因为vocab已经重新排序了，所以要重新生成HASH表
+      wordmeans_hash[a] = -1;  
+  size = wordmeans_size;  
+  for (a = 0; a < size; a++)  
+  {  
+    // Words occuring less than min_count times will be discarded from the vocab  
+    //出现太少的词直接丢弃  
+    if (wordmeans[a].cn < min_count)  
+    {   
+
+      wordmeans_size--;  
+      free(wordmeans[a].word);  
+      free(wordmeans[a].mean);
+      wordmeans[a].word=NULL;
+      wordmeans[a].mean=NULL;
+
+    }  
+    else  
+    {  
+      // Hash will be re-computed, as after the sorting it is not actual  
+      // 重新计算hash查找。vocab_hash是由hash值找到该词所在位置 
+
+      strcpy(wordmean,wordmeans[a].word);
+      strcat(wordmean,wordmeans[a].mean);
+      hash=GetWordMeanHash(wordmean);  
+      while (wordmeans_hash[hash] != -1) hash = (hash + 1) % wordmeans_hash_size;  
+      wordmeans_hash[hash] = a;  
+     //train_words += wordmeans[a].cn;  
+    }  
+  }
+  wordmeans= (struct wordmeans_wordmean *)realloc(wordmeans, (wordmeans_size + 1) * sizeof(struct wordmeans_wordmean));  
+  // Allocate memory for the binary tree construction   
+}
+
+void ReduceWordMeans()  
+{  
+  int a, b = 0;  
+  unsigned int hash; 
+  unsigned int word_hash;  
+  char *word;
+  int pos;
+  for (a = 0; a < wordmeans_size; a++){//我草，这很容易看错啊   //的确容易看错
+    if (wordmeans[a].cn > min_reduce)  
+    {  
+      wordmeans[b].cn = wordmeans[a].cn;  
+      wordmeans[b].word = wordmeans[a].word;
+      wordmeans[b].mean = wordmeans[a].mean;    
+      b++;  
+    } 
+    else {
+       free(wordmeans[a].word);
+       free(wordmeans[a].mean);
+    }
+  }
+  wordmeans_size = b;  
+  for (a = 0; a < wordmeans_hash_size; a++) wordmeans_hash[a] = -1;  //再次重新生成hash
+  for (a = 0; a < wordmeans_size; a++) {  
+    // Hash will be re-computed, as it is not actual 
+    char wordmean[2*MAX_STRING ];
+    strcpy(wordmean,wordmeans[wordmeans_hash[hash]].word);
+    strcat(wordmean,wordmeans[wordmeans_hash[hash]].mean);
+    hash = GetWordMeanHash(wordmean);  
+    while (wordmeans_hash[hash] != -1) hash = (hash + 1) % wordmeans_hash_size;  
+    wordmeans_hash[hash] = a;  
+  }  
+  fflush(stdout);  //ff(stdin)刷新标准输入缓冲区，把输入缓冲区里的东西丢弃   
+           //fflush(stdout)刷新标准输出缓冲区，把输出缓冲区里的东西打印到标准输出设备上。
+  //min_reduce++;  
   
+} 
 // Reduces the vocabulary by removing infrequent tokens  
 // 再次移除词频过小的词，缩减词汇表  
 void ReduceVocab()  
@@ -232,10 +451,36 @@ void ReduceVocab()
     vocab_hash[hash] = a;  
   }  
   fflush(stdout);  //ff(stdin)刷新标准输入缓冲区，把输入缓冲区里的东西丢弃   
-    		   //fflush(stdout)刷新标准输出缓冲区，把输出缓冲区里的东西打印到标准输出设备上。
-  min_reduce++;  
+           //fflush(stdout)刷新标准输出缓冲区，把输出缓冲区里的东西打印到标准输出设备上。
+  //min_reduce++;  
 }  
   
+
+void ImportHowNetMeans( char *file){
+  unsigned int length;
+  int count,pos;
+  int i,a;
+  for (a = 0; a < hownet_hash_size; a++) hownet_hash[a] = -1; 
+  FILE *fin=fopen(file,"rb");
+  char means[2*MAX_STRING];
+  char word[MAX_STRING];
+  while(!feof(fin)){
+      ReadWord(word,fin);
+      Readline(means,fin);
+      i = SearchHownet(word);//返回该词在词汇表中的位置  
+     if (i == -1)//该词之前不存在  
+      {  
+        a = AddWordToHowNet(word);
+        length = strlen(means) + 1;  
+        if (length > 5*MAX_STRING)  
+          length = 5*MAX_STRING; 
+         hownet[a].means = (char *)calloc(length, sizeof(char));
+         strcpy(hownet[a].means,means);
+     //把该词添加到词汇表中  //use the array to get meaning
+      }  
+  }
+  fclose(fin);
+}
 // Create binary Huffman tree using the word counts根据词频创建huffman树  
 // Frequent words will have short uniqe binary codes词频越大的单词有越短的huffman编码  
 void CreateBinaryTree() {  
@@ -325,42 +570,78 @@ void LearnVocabFromTrainFile()
 {  
   char word[MAX_STRING];  
   FILE *fin;  
-  long long a, i;  
-  for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;  
+  long long a, i; 
+  long long hownet_pos;
+  for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1; 
+  for(a=0;a<wordmeans_hash_size;a++)wordmeans_hash[a]=-1; 
+  char means[2*MAX_STRING];
+  char *mean;
+  int pos;
   fin = fopen(train_file, "rb");  
   if (fin == NULL)  
   {  
     printf("ERROR: training data file not found!\n");  
     exit(1);  
   }  
-  vocab_size = 0;  
+  vocab_size = 0;
+  wordmeans_size = 0;   
   AddWordToVocab((char *)"</s>");  
   while (1)  
   {  
-    ReadWord(word, fin);  
+    ReadWord(word, fin); 
     if (feof(fin)) break;  
     train_words++;  
     if ((debug_mode > 1) && (train_words % 100000 == 0))  
     {  
       printf("%lldK%c", train_words / 1000, 13);  
       fflush(stdout);  
-    }  
+    }
+    hownet_pos=SearchHownet(word);
     i = SearchVocab(word);//返回该词在词汇表中的位置  
-    if (i == -1)//该词之前不存在  
+    if (hownet_pos== -1)//can't find the word  
     {  
-      a = AddWordToVocab(word);//把该词添加到词汇表中  
-      vocab[a].cn = 1;  
+      continue;
     }  
-    else vocab[i].cn++;//更新词频  
-    if (vocab_size > vocab_hash_size * 0.7)//如果词汇表太庞大，就缩减  
-        ReduceVocab();  
-  }  
-  SortVocab();//根据词频排序词汇表  
-  if (debug_mode > 0)  
-  {  
-    printf("Vocab size: %lld\n", vocab_size);  
-    printf("Words in train file: %lld\n", train_words);  
-  }  
+    else{
+      if(i==-1){
+        a=AddWordToVocab(word);
+        vocab[a].cn=1;
+      }
+      else{
+        vocab[i].cn++;
+      }//get the meanings
+      const char *split=" ";
+      strcpy(means,hownet[hownet_pos].means);
+      mean=strtok(means,split);
+      pos=SearchWordMean(mean);
+      if(pos==-1){
+        a = AddWordMeanToWordMeans(mean);  
+        wordmeans[a].cn = 1;
+      }
+      else{
+        wordmeans[pos].cn++;
+      }
+      mean = strtok(NULL,split);
+      while(mean!=NULL && strcmp(mean," ")) { 
+        pos=SearchWordMean(mean);
+        if(pos==-1){
+          a = AddWordMeanToWordMeans(mean);  
+          wordmeans[a].cn = 1;
+        }
+        else{   
+          wordmeans[pos].cn++;
+        }
+        mean = strtok(NULL,split);
+      }
+      if (vocab_size > vocab_hash_size * 0.7){//如果词汇表太庞大，就缩减 //because the wordmeans and vocab have similary process of increasement    
+          ReduceVocab();
+      } 
+    }
+  }
+
+  printf("%lld,%lld\n",train_words,vocab_size);
+  SortVocab(); 
+  printf("%lld \n",vocab_size );
   file_size = ftell(fin);  
   fclose(fin);  
 }  
@@ -417,13 +698,13 @@ void ReadVocab()
 void InitNet()  
 {  
   long long a, b;  
-  a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));  
+  a = posix_memalign((void **)&syn0, 128, (long long)wordmeans_size * layer1_size * sizeof(real));  
   //先知道这个也是申请动态数组，对齐还有128这个参数以后再了解  
   /*int posix_memalign (void **memptr,
                     size_t alignment,
                     size_t size);
-	* See http://perens.com/FreeSoftware/ElectricFence/ and http://valgrind.org, respectively.
-	调用posix_memalign( )成功时会返回size字节的动态内存，并且这块内存的地址是alignment的倍数。参数alignment必须是2的幂，还是void指针的大小的	倍数。返回的内存块的地址放在了memptr里面，函数返回值是0.*/
+  * See http://perens.com/FreeSoftware/ElectricFence/ and http://valgrind.org, respectively.
+  调用posix_memalign( )成功时会返回size字节的动态内存，并且这块内存的地址是alignment的倍数。参数alignment必须是2的幂，还是void指针的大小的  倍数。返回的内存块的地址放在了memptr里面，函数返回值是0.*/
   if (syn0 == NULL)  
   {  
       printf("Memory allocation failed\n"); exit(1);  
@@ -439,35 +720,56 @@ void InitNet()
   //layer1_size是什么？
 //layer1_size词向量的维度，默认值是100  
     for (b = 0; b < layer1_size; b++)  
-        for (a = 0; a < vocab_size; a++)  
+        for (a = 0; a < wordmeans_size; a++)  
             syn1[a * layer1_size + b] = 0;  
   }  
   if (negative>0)//还有负样本  
   {  
-    a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(real));  
+    a = posix_memalign((void **)&syn1neg, 128, (long long)(wordmeans_size) * layer1_size * sizeof(real));  
     if (syn1neg == NULL)  
     {  
         printf("Memory allocation failed\n"); exit(1);  
     }  
     for (b = 0; b < layer1_size; b++)  
-        for (a = 0; a < vocab_size; a++)  
+        for (a = 0; a < wordmeans_size; a++)  
             syn1neg[a * layer1_size + b] = 0;  
   }  
 //初始化词向量，一共有vocab_size个单词，每个单词词向量维度是layer1_size
   for (b = 0; b < layer1_size; b++)  
-      for (a = 0; a < vocab_size; a++)  
+      for (a = 0; a < wordmeans_size; a++)  
           syn0[a * layer1_size + b] = (rand() / (real)RAND_MAX - 0.5) / layer1_size;  //随机初始化词向量
   CreateBinaryTree();//建立huffman树，对每个单词进行编码  
 }  
   
+void DestroyNet() {
+  if (syn0 != NULL) {
+    free(syn0);
+  }
+  if (syn1 != NULL) {
+    free(syn1);
+  }
+  if (syn1neg != NULL) {
+    free(syn1neg);
+  }
+}
+
   
 //这个线程函数执行之前，已经做好了一些工作：根据词频排序的词汇表，每个单词的huffman编码  
 void *TrainModelThread(void *id)  
 {  
-  long long a, b, d, word, last_word, sentence_length = 0, sentence_position = 0;  
+  long long a, b, d, word, last_word, sentence_length = 0, sentence_position = 0; 
+  long long last_wordmean; 
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];  
   long long l1, l2, c, target, label;  
-  unsigned long long next_random = (long long)id;  
+  unsigned long long next_random = (long long)id;
+  int hownet_pos;  
+  char means[2*MAX_STRING];
+  char wordstr[MAX_STRING];
+  char mean[MAX_STRING];
+  char wordmean[2*MAX_STRING];
+  int des_pos;
+  int res_pos;
+  long long wordmean_pos;
   real f, g;  
   clock_t now;  
   real *neu1 = (real *)calloc(layer1_size, sizeof(real));  //这是什么？
@@ -536,14 +838,38 @@ void *TrainModelThread(void *id)
         if (c < 0) continue;  
         if (c >= sentence_length) continue;  
         last_word = sen[c];  
-        if (last_word == -1) continue;  
+        if (last_word == -1) continue; 
+        hownet_pos=SearchHownet(vocab[last_word].word);
+        if(hownet_pos==-1)
+          continue;
+        strcpy(means,hownet[hownet_pos].means);
+        res_pos=0;
+        des_pos=0;
+        while(1)
+        { 
+          if(means[res_pos]=='\0' ) break;
+          if(means[res_pos]==' ' ) 
+          {
+            mean[des_pos]='\0';
+            wordmean_pos=SearchWordMean(mean);
+            last_wordmean=wordmean_pos;
+            if (last_wordmean != -1) {
+              for (c = 0; c < layer1_size; c++)//layer1_size词向量的维度，默认值是100  
+                neu1[c] += syn0[c + last_wordmean * layer1_size];
+            }
+            des_pos=0;
+            res_pos++;
+          }
+          else
+            mean[des_pos++]=means[res_pos++];
+       }
        //两个循环一起计算词向量的和
-        for (c = 0; c < layer1_size; c++)//layer1_size词向量的维度，默认值是100  
-            neu1[c] += syn0[c + last_word * layer1_size];//传说中的向量和？  //我也觉得是... //word2vec中的数学原理一文中的XW
+        
       }  
+
       if (hs) for (d = 0; d < vocab[word].codelen; d++)//开始遍历huffman树，每次一个节点  
       {  
-        f = 0;  
+        f = 0;    
         l2 = vocab[word].point[d] * layer1_size;//point应该记录的是huffman的路径。找到当前节点，并算出偏移  每一个词向量是占据一个layer1_size的
         // Propagate hidden -> output  
         for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1[c + l2];//计算内积  
@@ -599,10 +925,33 @@ void *TrainModelThread(void *id)
         if (c < 0) continue;  
         if (c >= sentence_length) continue;  
         last_word = sen[c];  
-        if (last_word == -1) continue;  
-        for (c = 0; c < layer1_size; c++)  
-            syn0[c + last_word * layer1_size] += neu1e[c];//更新词向量  
-      }  
+        if (last_word == -1) continue;       
+        hownet_pos=SearchHownet(vocab[last_word].word);
+        if(hownet_pos==-1)
+          continue;
+        strcpy(means,hownet[hownet_pos].means);
+        res_pos=0;
+        des_pos=0;
+        while(1)
+        { 
+          if(means[res_pos]=='\0' ) break;
+          if(means[res_pos]==' ' ) 
+          {
+            mean[des_pos]='\0';         
+            wordmean_pos=SearchWordMean(mean);
+            last_wordmean=wordmean_pos;
+            if(last_wordmean != -1) {
+              for (c = 0; c < layer1_size; c++)//layer1_size词向量的维度，默认值是100  
+                syn0[c + last_wordmean * layer1_size] += neu1e[c]; //更新词向量 
+            }
+            des_pos=0;
+            res_pos++;
+          }
+          else
+            mean[des_pos++]=means[res_pos++];
+            
+       }
+     }  
     }  
     else  
     {  //train skip-gram  
@@ -702,8 +1051,6 @@ void TrainModel()
       SaveVocab();//保存词汇  
   if (output_file[0] == 0)  
       return;  
-  printf("%lld\n", vocab_size);
-  getchar();
   InitNet();  
   if (negative > 0) InitUnigramTable();  
   start = clock();  
@@ -725,10 +1072,10 @@ void TrainModel()
   if (classes == 0) //不需要聚类，只需要输出词向量  
   {  
     // Save the word vectors  
-    fprintf(fo, "%lld %lld\n", vocab_size, layer1_size);  
-    for (a = 0; a < vocab_size; a++)  
+    fprintf(fo, "%lld %lld\n", wordmeans_size, layer1_size);  
+    for (a = 0; a < wordmeans_size; a++)  
     {  
-      fprintf(fo, "%s ", vocab[a].word);  
+      fprintf(fo, "%s ", wordmeans[a].mean);   
       if (binary)  
           for (b = 0; b < layer1_size; b++)  
               fwrite(&syn0[a * layer1_size + b], sizeof(real), 1, fo);  
@@ -754,7 +1101,7 @@ void TrainModel()
           cent[b] = 0;//质心清零  
       for (b = 0; b < clcn; b++)  
           centcn[b] = 1;  
-      for (c = 0; c < vocab_size; c++)  
+      for (c = 0; c < wordmeans_size; c++)  
       {  
         for (d = 0; d < layer1_size; d++)  
             cent[layer1_size * cl[c] + d] += syn0[c * layer1_size + d];//求和放到质心数组中  
@@ -772,7 +1119,7 @@ void TrainModel()
         for (c = 0; c < layer1_size; c++)  
             cent[layer1_size * b + c] /= closev;//对质心进行归一化？  
       }  
-      for (c = 0; c < vocab_size; c++)//对所有词语重新分类  
+      for (c = 0; c < wordmeans_size; c++)//对所有词语重新分类  
       {  
         closev = -10;  
         closeid = 0;  
@@ -792,7 +1139,7 @@ void TrainModel()
     }  
     // Save the K-means classes  
     for (a = 0; a < vocab_size; a++)  
-        fprintf(fo, "%s %d\n", vocab[a].word, cl[a]);  
+        fprintf(fo, "%s  %s %d\n", wordmeans[a].word,wordmeans[a].mean, cl[a]);  
     free(centcn);  
     free(cent);  
     free(cl);  
@@ -822,6 +1169,9 @@ int main(int argc, char **argv) {
     printf("Options:\n");  
     printf("Parameters for training:\n");  
   
+
+    printf("\t -dict <dictionary file> \n");
+    printf("\t\t Use word and it's meanings from <dictionary file> to train the model");
     //输入文件：已分词的语料  
     printf("\t-train <file>\n");  
     printf("\t\tUse text data from <file> to train the model\n");  
@@ -881,6 +1231,7 @@ int main(int argc, char **argv) {
   
     //词汇从该文件读取，而不是由训练数据重组  
     printf("\t-read-vocab <file>\n");  
+
     printf("\t\tThe vocabulary will be read from <file>, not constructed from the training data\n");  
   
     //是否采用continuous bag of words算法。默认是0，表示采用另一个叫skip-gram的算法。  
@@ -895,6 +1246,7 @@ int main(int argc, char **argv) {
   output_file[0] = 0;  
   save_vocab_file[0] = 0;  
   read_vocab_file[0] = 0;  
+  if ((i =ArgPos((char *)"-dict",argc,argv))>0) strcpy(dictionary_file,argv[i+1]);
   if ((i = ArgPos((char *)"-size", argc, argv)) > 0) layer1_size = atoi(argv[i + 1]);  
   if ((i = ArgPos((char *)"-train", argc, argv)) > 0) strcpy(train_file, argv[i + 1]);  
   if ((i = ArgPos((char *)"-save-vocab", argc, argv)) > 0) strcpy(save_vocab_file, argv[i + 1]);  
@@ -911,9 +1263,13 @@ int main(int argc, char **argv) {
   if ((i = ArgPos((char *)"-threads", argc, argv)) > 0) num_threads = atoi(argv[i + 1]);  
   if ((i = ArgPos((char *)"-min-count", argc, argv)) > 0) min_count = atoi(argv[i + 1]);  
   if ((i = ArgPos((char *)"-classes", argc, argv)) > 0) classes = atoi(argv[i + 1]);  
-  vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));  
-  vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));  
-  expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real));  
+  vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
+  wordmeans_hash = (int *)calloc(wordmeans_hash_size, sizeof(int));  
+  hownet_hash=(int *)calloc(hownet_hash_size,sizeof(int));
+  vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
+  hownet=(struct hownet_word*)calloc(hownet_max_size,sizeof(struct hownet_word));
+  wordmeans=(struct wordmeans_wordmean*)calloc(wordmeans_max_size,sizeof(struct wordmeans_wordmean));  
+  expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real)); 
   for (i = 0; i < EXP_TABLE_SIZE; i++)  
   {  
     //expTable[i] = exp((i -500)/ 500 * 6) 即 e^-6 ~ e^6  
@@ -921,6 +1277,10 @@ int main(int argc, char **argv) {
     //expTable[i] = 1/(1+e^6) ~ 1/(1+e^-6)即 0.01 ~ 1 的样子  
     expTable[i] = expTable[i] / (expTable[i] + 1);                   // Precompute f(x) = x / (x + 1)  
   }  
+  ImportHowNetMeans(dictionary_file);
   TrainModel();  
+  DestroyNet();
+  free(vocab_hash);
+  free(expTable);
   return 0;  
 }  
